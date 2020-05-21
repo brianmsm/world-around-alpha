@@ -1,0 +1,272 @@
+---
+title: "The world revolves around Cronbach’s alpha (α ≥ 0.70)"
+date: "19/5/2020"
+author:
+  - name: José Ventura-León
+    email: jose.ventura@upn.pe
+    affiliation: Universidad Privada del Norte
+  - name: Brian N. Peña-Calero
+    email: brianmsm@gmail.com
+    affiliation: Grupo de Estudios Avances en Medición Psicológica, Universidad Nacional Mayor de San Marcos, Lima, Perú
+output: 
+  html_notebook: 
+    number_sections: yes
+    toc: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+# Preparations for analysis
+
+Loading packages to simulate and manipulate data. You need to have the `pacman` package installed. If you do not have it, try this `install.packages("pacman")`.
+```{r}
+pacman::p_load(tidyverse, MASS, psych, lavaan)
+pacman::p_load_gh("tidyverse/multidplyr")
+```
+
+# Simulate data
+
+Data generation is performed by simulating multivariate data based on the following conditions:
+- Correlation matrix between the items: 0.10, 0.15, 0.20, 0.25
+- Number of observations: 50, 100, 250, 500, 1000
+- Number of items: 3 to 12 items
+- Number of replications: 1000
+
+In this way, 200 *dataframes* are generated with different amounts of data within each of them, which will have 1,000 *replications*. In total, 200,000 *dataframes* with observations within each of them will be taken for analysis.
+
+## Generate matrices and observations
+
+Create the variables that indicate the conditions
+
+```{r}
+set.seed(2019)
+
+r <- seq(0.10, 0.25, 0.05) ## Correlations from 0.10 to 0.25
+n <- c(50, 100, 250, 500, 1000) ## Size samples
+replic <- 1000
+```
+
+There will be a quadruple for loop to generate the data 10x5x4x1000(rep).
+*This code is computationally intensive and consumes approximately 4.8 gb of ram.*
+
+```{r}
+# Create blank lists
+sigma <- list() # It will store the matrices of the items
+items <- list() # It will store the generated items 
+
+for(i in 1:10) { # 10 different quantity of items 
+  sigma[[i]] <- list() 
+  items[[i]] <- list() 
+  for (j in seq_along(r)) { # Change according to the different correlation matrices
+    sigma[[i]][[j]] <- matrix(data = rep(c(1, rep(r[j], i+2)), i+2),
+                              nrow = i+2, 
+                              ncol = i+2) 
+    items[[i]][[j]] <- list()
+    for (k in seq_along(n)) { # Change based on sample size 
+      items[[i]][[j]][[k]] <- list()
+      for(l in 1:replic) { # Change based on number of replications (1,000)
+        items[[i]][[j]][[k]][[l]] <- mvrnorm(n = n[k], 
+                                             mu = rep(0, i+2), 
+                                             Sigma = sigma[[i]][[j]]) %>% 
+          as_tibble() %>% 
+            mutate_all(list(Item = ~ findInterval(., c(-Inf, -2,  -1, 1,  2, Inf)))) # Perform a symmetrical scaling of the items
+      }
+    }
+  }
+}
+
+# Delete temporary indexes
+rm(i, j, k, l)
+```
+
+## Format the data as dataframe / tibbles
+
+The nested lists that we have created will be put together in order to have them identified with columns that indicate the sample size, the correlation and the replication number with which they were simulated.
+
+```{r}
+temp <- items
+items <- list()
+for(i in 1:10) {
+  items[[i]] <- list()
+  for(j in seq_along(r)) {
+    items[[i]][[j]] <- list()
+    for(k in seq_along(n)) {
+      items[[i]][[j]][[k]] <- temp[[i]][[j]][[k]] %>% 
+        bind_rows(.id = "replic")
+    }
+    items[[i]][[j]] <- items[[i]][[j]] %>% 
+      bind_rows(.id = "n") %>% 
+      mutate(n = recode(n, "1" = 50, "2" = 100,
+                        "3" = 250, "4" = 500, 
+                        "5" = 1000))
+  }
+  items[[i]] <- items[[i]] %>% 
+    bind_rows(.id = "correlation") %>% 
+    mutate(correlation = recode(correlation, "1" = 0.1,
+                                "2" = 0.15, "3" = 0.2,
+                                "4" = 0.25)) %>% 
+  group_nest(correlation, n, replic)
+}
+```
+
+```{r echo = TRUE, results = 'hide'}
+# Delete temporary indexes
+rm(i, j, k, temp)
+gc()
+```
+
+```{r}
+items <- items %>% 
+  bind_rows(.id = "items") %>% 
+  mutate(items = recode(items, "1" = "3 items",
+                        "2" = "4 items", "3" = "5 items",
+                        "4" = "6 items", "5" = "7 items",
+                        "6" = "8 items", "7" = "9 items",
+                        "8" = "10 items", "9" = "11 items",
+                        "10" = "12 items"))
+
+items
+```
+
+
+# Reliability analysis
+
+The `multidplyr` package will be used so that the calculation uses all the processor cores.
+
+```{r}
+cluster <- new_cluster(parallel::detectCores())
+
+items <- items %>% 
+  partition(cluster) %>% 
+  mutate(
+    alfa_psych = purrr::map(data,
+                            ~ psych::alpha(dplyr::select(., -dplyr::ends_with("Item")))),
+    alfa_coef  = purrr::map_dbl(alfa_psych,
+                                ~ purrr::pluck(.x, "total", "raw_alpha"))
+  ) %>% 
+  collect()
+
+items
+```
+
+To lighten the consumption of ram memory, another object is created where it contains the variables of interest and deletes others (such as `data`).
+
+```{r}
+item_fiab <- items %>% 
+  dplyr::select(-c(data, alfa_psych)) %>% 
+  mutate(
+    replic = as.numeric(replic),
+    items = fct_relevel(items, "12 items", "11 items", "10 items", after = Inf)
+  ) %>% 
+  arrange(items, correlation, n, replic)
+
+item_fiab
+```
+
+```{r echo = TRUE, results = 'hide'}
+# Delete `items` object
+rm(items)
+gc()
+```
+
+# Make summary graph 
+
+The alpha coefficients that are greater than 0.7 are counted to analyze their frequency according to the simulation conditions.
+
+```{r}
+item_fiab <- item_fiab %>% 
+  mutate(
+    dx_alfa_coef = case_when(
+      alfa_coef >= 0.7 ~ "good",
+      TRUE ~ "bad"
+      )
+  ) %>% 
+  rename(n_samp = n)
+
+item_fiab
+```
+
+Data is sorted
+```{r}
+item_plot <- item_fiab %>% 
+  group_by(items, n_samp, correlation) %>% 
+  count(dx_alfa_coef) %>% 
+  ungroup() %>% 
+  pivot_wider(
+    names_from = dx_alfa_coef,
+    values_from = n,
+    values_fill = list(n = 0)
+  ) %>% 
+  mutate(
+    Percentage = good/(bad + good)
+  ) 
+
+item_plot
+```
+
+
+From this ordering of the data a bar graph is made with `ggplot2`
+
+```{r fig.height = 5, fig.width = 9.5, dpi = 300, fig.align = "center"}
+plot_item <- item_plot %>% 
+  ggplot(aes(x = correlation, 
+             y = Percentage, 
+             alpha = correlation, 
+             label = scales::percent(Percentage,
+                                     accuracy = 1)))  +
+  geom_col() +
+  scale_y_continuous(
+    limits = c(-0.1, 1.2),
+    breaks = c(0, 0.5, 1),
+    labels = scales::percent_format()
+    ) +
+  coord_flip() +
+  geom_label(
+    size = 2.2,
+    label.size = 0.25, 
+    label.r = unit(0.10, "lines"),
+    label.padding = unit(0.15, "lines"),
+    show.legend = FALSE
+    ) +
+  scale_alpha_continuous(
+    name = "Correlation",
+    guide = guide_legend(reverse = TRUE)
+    ) +
+  facet_grid(n_samp ~ items) +
+  labs(
+    title = "Percentage of cases with alpha reliability greater than 0.70",
+    subtitle = "The percentage is calculated based on 1000 replications in each condition",
+    y = "",
+    x = ""
+  ) + 
+  theme_bw() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5),
+    text = element_text(
+      size = 11,
+      face="bold"), 
+    axis.text = element_text(
+      size = 7,
+      face="plain",
+      colour="black"),
+    legend.title = element_text(
+      size = 11,
+      face = "bold"
+    ),
+    legend.text = element_text(
+      face="plain",
+      colour="black",
+      size=10)
+  )
+
+```
+
+![](Plot item status.png)
+
+# Information about session Rstudio
+```{r}
+sessionInfo()
+```
+
